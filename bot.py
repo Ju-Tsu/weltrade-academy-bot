@@ -1,24 +1,17 @@
 """
-Weltrade Academy Bot
-─────────────────────────────────────────────────────
-Деплой: Railway
-Фреймворк: aiogram 3.x
-Python: 3.11+
-
-Что умеет сейчас (MVP):
-  /start  — приветствие + кнопка открытия TMA
-  /help   — краткая справка
-  Webhook от TMA — поздравление при завершении модуля
-
-Следующая итерация:
-  - Day-1 / Day-3 retention push
-  - Напоминание вернуться если юзер не заходил 48ч
-  - Финальный CTA после 5-го модуля
+Weltrade Academy Bot v2 — с retention пушами
+─────────────────────────────────────────────
+Day 1 push: юзер не вернулся через 24ч после /start
+Day 3 push: юзер не вернулся через 72ч
+Персональные: упоминает на каком модуле остановился
 """
 
 import asyncio
+import json
 import logging
 import os
+import time
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
@@ -28,10 +21,9 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiohttp import web
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-# Все секреты — через переменные окружения Railway (не хардкодим!)
-BOT_TOKEN   = os.environ["BOT_TOKEN"]        # токен от @BotFather
-TMA_URL     = os.environ["TMA_URL"]          # https://weltrade-academy.vercel.app
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # https://твой-домен.railway.app
+BOT_TOKEN   = os.environ["BOT_TOKEN"]
+TMA_URL     = os.environ["TMA_URL"]
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT        = int(os.environ.get("PORT", 8080))
 
 logging.basicConfig(level=logging.INFO)
@@ -40,9 +32,40 @@ log = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
+# ─── User Storage (JSON файл) ─────────────────────────────────────────────────
+# Для MVP храним юзеров в JSON на диске.
+# Следующая итерация: заменить на Firebase или PostgreSQL.
+USERS_FILE = Path("users.json")
+
+def load_users() -> dict:
+    try:
+        if USERS_FILE.exists():
+            return json.loads(USERS_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+def save_users(users: dict):
+    try:
+        USERS_FILE.write_text(json.dumps(users, indent=2))
+    except Exception as e:
+        log.error(f"Failed to save users: {e}")
+
+def get_user(user_id: int) -> dict:
+    users = load_users()
+    return users.get(str(user_id), {})
+
+def upsert_user(user_id: int, data: dict):
+    """Обновляем данные юзера, не перезаписывая остальные поля."""
+    users = load_users()
+    uid = str(user_id)
+    existing = users.get(uid, {})
+    existing.update(data)
+    users[uid] = existing
+    save_users(users)
+
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 def kb_open_academy() -> InlineKeyboardMarkup:
-    """Кнопка открытия TMA — главная точка входа."""
     builder = InlineKeyboardBuilder()
     builder.button(
         text="🎓 Open Academy",
@@ -50,8 +73,15 @@ def kb_open_academy() -> InlineKeyboardMarkup:
     )
     return builder.as_markup()
 
+def kb_continue() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="▶ Continue Learning",
+        web_app=WebAppInfo(url=TMA_URL)
+    )
+    return builder.as_markup()
+
 def kb_open_and_register() -> InlineKeyboardMarkup:
-    """Две кнопки: открыть академию + зарегистрироваться."""
     builder = InlineKeyboardBuilder()
     builder.button(
         text="🎓 Continue Learning",
@@ -61,17 +91,37 @@ def kb_open_and_register() -> InlineKeyboardMarkup:
         text="🚀 Create Account",
         url="https://track.gowt.me/visit/?bta=66558&brand=weltrade&utm_source=telegram_organic&utm_medium=bot&utm_campaign=bot_graduation_cta"
     )
-    builder.adjust(1)  # кнопки в столбик
+    builder.adjust(1)
     return builder.as_markup()
+
+# ─── Module titles (для персональных пушей) ───────────────────────────────────
+MODULE_TITLES = {
+    "mod_01": "Intro to Markets",
+    "mod_02": "Reading Charts",
+    "mod_03": "Risk Management",
+    "mod_04": "Your First Trade",
+    "mod_05": "Trading Psychology",
+}
 
 # ─── /start ───────────────────────────────────────────────────────────────────
 @dp.message(CommandStart())
 async def handle_start(message: types.Message):
-    """
-    Первое сообщение — знакомство с академией.
-    Короткий текст + кнопка TMA. Никакого лишнего текста.
-    """
-    first_name = message.from_user.first_name or "Trader"
+    user = message.from_user
+    first_name = user.first_name or "Trader"
+    now = time.time()
+
+    # Сохраняем юзера — время старта, имя, статус пушей
+    upsert_user(user.id, {
+        "id":           user.id,
+        "first_name":   first_name,
+        "username":     user.username or "",
+        "started_at":   now,
+        "last_seen":    now,
+        "current_module": "mod_01",
+        "completed_modules": [],
+        "day1_push_sent": False,
+        "day3_push_sent": False,
+    })
 
     await message.answer(
         f"Hey {first_name} 👋\n\n"
@@ -83,60 +133,29 @@ async def handle_start(message: types.Message):
         reply_markup=kb_open_academy()
     )
 
-    log.info(f"New user: {message.from_user.id} (@{message.from_user.username})")
+    log.info(f"New user: {user.id} (@{user.username})")
 
 # ─── /help ────────────────────────────────────────────────────────────────────
 @dp.message(Command("help"))
 async def handle_help(message: types.Message):
     await message.answer(
         "🎓 <b>Weltrade Academy</b>\n\n"
-        "Learn the basics of Forex trading through bite-sized modules:\n\n"
+        "5 modules · ~36 min total:\n\n"
         "1️⃣ Intro to Markets\n"
         "2️⃣ Reading Charts\n"
         "3️⃣ Risk Management\n"
         "4️⃣ Your First Trade\n"
         "5️⃣ Trading Psychology\n\n"
-        "Each module takes 6–8 minutes. Complete all 5 to earn the "
-        "<b>Academy Graduate 👑</b> badge.",
+        "Complete all 5 to earn the <b>Academy Graduate 👑</b> badge.",
         parse_mode="HTML",
         reply_markup=kb_open_academy()
     )
 
-# ─── Webhook от TMA (module_completed) ───────────────────────────────────────
-"""
-TMA отправляет POST на /tma-webhook когда юзер завершает модуль.
-Бот получает сигнал и пишет юзеру поздравление в чат.
-
-Как подключить со стороны TMA:
-В engine.js → trackModuleCompleted добавь:
-
-  fetch("/tma-webhook", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      user_id:      tg?.initDataUnsafe?.user?.id,
-      module_id:    mod.id,
-      module_title: mod.title,
-      xp_earned:    mod.totalXP,
-      total_xp:     totalXP,
-      badge_icon:   mod.badge.icon,
-      badge_name:   mod.badge.name,
-      is_last:      modIdx === MODULES.length - 1,
-    })
-  });
-"""
-
-MODULE_MESSAGES = {
-    "mod_01": "Great start! Markets are no longer a mystery 🌐",
-    "mod_02": "You can now read a chart like a pro 📊",
-    "mod_03": "Risk management unlocked — the #1 skill of profitable traders 🛡️",
-    "mod_04": "You have a real trading process now 🚀",
-    "mod_05": "You made it. Most traders never study psychology — you did 👑",
-}
-
+# ─── Webhook от TMA ───────────────────────────────────────────────────────────
 async def handle_tma_webhook(request: web.Request) -> web.Response:
     """
-    Получаем событие от TMA и отправляем сообщение юзеру в Telegram.
+    TMA сообщает боту о прогрессе юзера.
+    Обновляем last_seen и текущий модуль — пуши становятся точнее.
     """
     try:
         data = await request.json()
@@ -152,28 +171,52 @@ async def handle_tma_webhook(request: web.Request) -> web.Response:
         if not user_id:
             return web.json_response({"ok": False, "error": "no user_id"})
 
-        # Кастомный текст для каждого модуля
+        # Обновляем прогресс юзера
+        user = get_user(int(user_id))
+        completed = user.get("completed_modules", [])
+        if module_id not in completed:
+            completed.append(module_id)
+
+        # Определяем следующий модуль
+        module_ids = list(MODULE_TITLES.keys())
+        current_idx = module_ids.index(module_id) if module_id in module_ids else 0
+        next_module = module_ids[current_idx + 1] if current_idx + 1 < len(module_ids) else module_id
+
+        upsert_user(int(user_id), {
+            "last_seen":          time.time(),
+            "current_module":     next_module,
+            "completed_modules":  completed,
+            # Сбрасываем пуши — юзер активен, не спамим
+            "day1_push_sent":     True,
+            "day3_push_sent":     False,
+        })
+
+        # Отправляем поздравление
+        MODULE_MESSAGES = {
+            "mod_01": "Markets are no longer a mystery 🌐",
+            "mod_02": "You can now read a chart like a pro 📊",
+            "mod_03": "Risk management unlocked — the #1 skill of profitable traders 🛡️",
+            "mod_04": "You have a real trading process now 🚀",
+            "mod_05": "Most traders never study psychology — you did 👑",
+        }
         flavor = MODULE_MESSAGES.get(module_id, "Module complete!")
 
         if is_last:
-            # Финальное сообщение — максимальный CTA
             text = (
                 f"{badge_icon} <b>Academy Graduate!</b>\n\n"
                 f"{flavor}\n\n"
                 f"You've completed all 5 modules and earned <b>{total_xp} XP</b>.\n\n"
-                f"You now have everything you need to start trading. "
-                f"Open a real account and make your first trade 👇"
+                f"You now have everything you need. Open a real account and make your first trade 👇"
             )
             keyboard = kb_open_and_register()
         else:
-            # Промежуточное поздравление
             text = (
                 f"{badge_icon} <b>{module_title} complete!</b>\n\n"
                 f"{flavor}\n\n"
-                f"<b>+{xp_earned} XP</b> earned · Total: <b>{total_xp} XP</b>\n\n"
+                f"<b>+{xp_earned} XP</b> · Total: <b>{total_xp} XP</b>\n\n"
                 f"Ready for the next module? 👇"
             )
-            keyboard = kb_open_academy()
+            keyboard = kb_continue()
 
         await bot.send_message(
             chat_id=user_id,
@@ -182,25 +225,131 @@ async def handle_tma_webhook(request: web.Request) -> web.Response:
             reply_markup=keyboard
         )
 
-        log.info(f"Module complete message sent: user={user_id} module={module_id}")
         return web.json_response({"ok": True})
 
     except Exception as e:
         log.error(f"TMA webhook error: {e}")
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
+# ─── Retention Push Logic ─────────────────────────────────────────────────────
+async def send_day1_push(user: dict):
+    """24ч без активности — напоминаем вернуться."""
+    uid = user["id"]
+    first_name = user.get("first_name", "Trader")
+    current_mod = user.get("current_module", "mod_01")
+    mod_title = MODULE_TITLES.get(current_mod, "your next module")
+    completed_count = len(user.get("completed_modules", []))
+
+    if completed_count == 0:
+        # Не начал ни одного модуля
+        text = (
+            f"Hey {first_name} 👋\n\n"
+            f"You haven't started yet — and that's okay.\n\n"
+            f"<b>Intro to Markets</b> takes just 7 minutes. "
+            f"That's less time than your morning coffee ☕\n\n"
+            f"Ready when you are 👇"
+        )
+    else:
+        # Начал, но не закончил
+        text = (
+            f"Hey {first_name} 👋\n\n"
+            f"You left off on <b>{mod_title}</b>.\n\n"
+            f"You're {completed_count}/5 modules in — "
+            f"keep going and earn your <b>Academy Graduate 👑</b> badge.\n\n"
+            f"Takes less than 8 minutes 👇"
+        )
+
+    try:
+        await bot.send_message(
+            chat_id=uid,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=kb_continue()
+        )
+        upsert_user(uid, {"day1_push_sent": True})
+        log.info(f"Day 1 push sent: user={uid}")
+    except Exception as e:
+        log.warning(f"Day 1 push failed for {uid}: {e}")
+
+async def send_day3_push(user: dict):
+    """72ч без активности — более сильный CTA."""
+    uid = user["id"]
+    first_name = user.get("first_name", "Trader")
+    current_mod = user.get("current_module", "mod_01")
+    mod_title = MODULE_TITLES.get(current_mod, "your next module")
+
+    text = (
+        f"Hey {first_name} — still thinking about trading? 📈\n\n"
+        f"<b>{mod_title}</b> is waiting for you.\n\n"
+        f"Most people who start Weltrade Academy and finish "
+        f"all 5 modules make their first trade within a week.\n\n"
+        f"You're closer than you think 👇"
+    )
+
+    try:
+        await bot.send_message(
+            chat_id=uid,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=kb_open_and_register()
+        )
+        upsert_user(uid, {"day3_push_sent": True})
+        log.info(f"Day 3 push sent: user={uid}")
+    except Exception as e:
+        log.warning(f"Day 3 push failed for {uid}: {e}")
+
+# ─── Scheduler — проверяем каждый час ─────────────────────────────────────────
+async def retention_scheduler():
+    """
+    Каждый час проходим по всем юзерам и проверяем:
+    - Прошло 24ч с last_seen и day1_push не отправлен → Day 1 push
+    - Прошло 72ч с last_seen и day3_push не отправлен → Day 3 push
+    Не отправляем тем кто уже прошёл все модули.
+    """
+    while True:
+        await asyncio.sleep(3600)  # проверяем каждый час
+        now = time.time()
+        users = load_users()
+
+        log.info(f"Retention check: {len(users)} users")
+
+        for uid, user in users.items():
+            # Пропускаем тех кто прошёл все 5 модулей
+            if len(user.get("completed_modules", [])) >= 5:
+                continue
+
+            last_seen = user.get("last_seen", now)
+            hours_inactive = (now - last_seen) / 3600
+
+            # Day 1 push: 24-48ч без активности
+            if (24 <= hours_inactive < 48
+                    and not user.get("day1_push_sent", False)):
+                await send_day1_push(user)
+                await asyncio.sleep(0.1)  # небольшая пауза между отправками
+
+            # Day 3 push: 72ч+ без активности
+            elif (hours_inactive >= 72
+                    and not user.get("day3_push_sent", False)):
+                await send_day3_push(user)
+                await asyncio.sleep(0.1)
+
 # ─── Health check ─────────────────────────────────────────────────────────────
 async def handle_health(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "service": "weltrade-academy-bot"})
+    users = load_users()
+    return web.json_response({
+        "status": "ok",
+        "users_total": len(users),
+        "service": "weltrade-academy-bot"
+    })
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
 async def on_startup(app: web.Application):
     if WEBHOOK_URL:
-        webhook_path = "/webhook"
-        await bot.set_webhook(f"{WEBHOOK_URL}{webhook_path}")
-        log.info(f"Webhook set: {WEBHOOK_URL}{webhook_path}")
-    else:
-        log.warning("WEBHOOK_URL not set — running in polling mode")
+        await bot.set_webhook(f"{WEBHOOK_URL}/webhook")
+        log.info(f"Webhook set: {WEBHOOK_URL}/webhook")
+    # Запускаем планировщик в фоне
+    asyncio.create_task(retention_scheduler())
+    log.info("Retention scheduler started")
 
 async def on_shutdown(app: web.Application):
     await bot.delete_webhook()
@@ -208,24 +357,15 @@ async def on_shutdown(app: web.Application):
 
 def create_app() -> web.Application:
     app = web.Application()
-
-    # Telegram webhook
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
-
-    # TMA events webhook
     app.router.add_post("/tma-webhook", handle_tma_webhook)
-
-    # Health check для Railway
     app.router.add_get("/health", handle_health)
-
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
-
     setup_application(app, dp, bot=bot)
     return app
 
-# ─── Entry Point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app = create_app()
-    log.info(f"Starting bot on port {PORT}")
+    log.info(f"Starting on port {PORT}")
     web.run_app(app, host="0.0.0.0", port=PORT)
