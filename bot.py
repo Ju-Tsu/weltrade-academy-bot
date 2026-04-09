@@ -1,9 +1,5 @@
 """
-Weltrade Academy Bot v2 — с retention пушами
-─────────────────────────────────────────────
-Day 1 push: юзер не вернулся через 24ч после /start
-Day 3 push: юзер не вернулся через 72ч
-Персональные: упоминает на каком модуле остановился
+Weltrade Academy Bot v2 — retention pushes + CORS fix
 """
 
 import asyncio
@@ -13,9 +9,9 @@ import os
 import time
 from pathlib import Path
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from aiogram.types import InlineKeyboardMarkup, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
@@ -32,9 +28,31 @@ log = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
-# ─── User Storage (JSON файл) ─────────────────────────────────────────────────
-# Для MVP храним юзеров в JSON на диске.
-# Следующая итерация: заменить на Firebase или PostgreSQL.
+# ─── CORS Middleware ──────────────────────────────────────────────────────────
+# Нужен чтобы TMA на Vercel мог слать запросы на Railway
+@web.middleware
+async def cors_middleware(request: web.Request, handler):
+    # Preflight запрос от браузера — отвечаем сразу
+    if request.method == "OPTIONS":
+        return web.Response(
+            status=200,
+            headers={
+                "Access-Control-Allow-Origin":  "*",
+                "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type",
+            }
+        )
+    try:
+        response = await handler(request)
+    except web.HTTPException as ex:
+        response = ex
+
+    response.headers["Access-Control-Allow-Origin"]  = "*"
+    response.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
+# ─── User Storage ─────────────────────────────────────────────────────────────
 USERS_FILE = Path("users.json")
 
 def load_users() -> dict:
@@ -51,12 +69,7 @@ def save_users(users: dict):
     except Exception as e:
         log.error(f"Failed to save users: {e}")
 
-def get_user(user_id: int) -> dict:
-    users = load_users()
-    return users.get(str(user_id), {})
-
 def upsert_user(user_id: int, data: dict):
-    """Обновляем данные юзера, не перезаписывая остальные поля."""
     users = load_users()
     uid = str(user_id)
     existing = users.get(uid, {})
@@ -64,29 +77,23 @@ def upsert_user(user_id: int, data: dict):
     users[uid] = existing
     save_users(users)
 
+def get_user(user_id: int) -> dict:
+    return load_users().get(str(user_id), {})
+
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 def kb_open_academy() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(
-        text="🎓 Open Academy",
-        web_app=WebAppInfo(url=TMA_URL)
-    )
+    builder.button(text="🎓 Open Academy", web_app=WebAppInfo(url=TMA_URL))
     return builder.as_markup()
 
 def kb_continue() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(
-        text="▶ Continue Learning",
-        web_app=WebAppInfo(url=TMA_URL)
-    )
+    builder.button(text="▶ Continue Learning", web_app=WebAppInfo(url=TMA_URL))
     return builder.as_markup()
 
 def kb_open_and_register() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(
-        text="🎓 Continue Learning",
-        web_app=WebAppInfo(url=TMA_URL)
-    )
+    builder.button(text="▶ Continue Learning", web_app=WebAppInfo(url=TMA_URL))
     builder.button(
         text="🚀 Create Account",
         url="https://track.gowt.me/visit/?bta=66558&brand=weltrade&utm_source=telegram_organic&utm_medium=bot&utm_campaign=bot_graduation_cta"
@@ -94,13 +101,21 @@ def kb_open_and_register() -> InlineKeyboardMarkup:
     builder.adjust(1)
     return builder.as_markup()
 
-# ─── Module titles (для персональных пушей) ───────────────────────────────────
+# ─── Module titles ────────────────────────────────────────────────────────────
 MODULE_TITLES = {
     "mod_01": "Intro to Markets",
     "mod_02": "Reading Charts",
     "mod_03": "Risk Management",
     "mod_04": "Your First Trade",
     "mod_05": "Trading Psychology",
+}
+
+MODULE_MESSAGES = {
+    "mod_01": "Markets are no longer a mystery 🌐",
+    "mod_02": "You can now read a chart like a pro 📊",
+    "mod_03": "Risk management unlocked — the #1 skill of profitable traders 🛡️",
+    "mod_04": "You have a real trading process now 🚀",
+    "mod_05": "Most traders never study psychology — you did 👑",
 }
 
 # ─── /start ───────────────────────────────────────────────────────────────────
@@ -110,17 +125,16 @@ async def handle_start(message: types.Message):
     first_name = user.first_name or "Trader"
     now = time.time()
 
-    # Сохраняем юзера — время старта, имя, статус пушей
     upsert_user(user.id, {
-        "id":           user.id,
-        "first_name":   first_name,
-        "username":     user.username or "",
-        "started_at":   now,
-        "last_seen":    now,
-        "current_module": "mod_01",
+        "id":                user.id,
+        "first_name":        first_name,
+        "username":          user.username or "",
+        "started_at":        now,
+        "last_seen":         now,
+        "current_module":    "mod_01",
         "completed_modules": [],
-        "day1_push_sent": False,
-        "day3_push_sent": False,
+        "day1_push_sent":    False,
+        "day3_push_sent":    False,
     })
 
     await message.answer(
@@ -132,7 +146,6 @@ async def handle_start(message: types.Message):
         parse_mode="HTML",
         reply_markup=kb_open_academy()
     )
-
     log.info(f"New user: {user.id} (@{user.username})")
 
 # ─── /help ────────────────────────────────────────────────────────────────────
@@ -151,79 +164,80 @@ async def handle_help(message: types.Message):
         reply_markup=kb_open_academy()
     )
 
-# ─── Webhook от TMA ───────────────────────────────────────────────────────────
+# ─── TMA Webhook ─────────────────────────────────────────────────────────────
 async def handle_tma_webhook(request: web.Request) -> web.Response:
-    """
-    TMA сообщает боту о прогрессе юзера.
-    Обновляем last_seen и текущий модуль — пуши становятся точнее.
-    """
     try:
         data = await request.json()
-        user_id      = data.get("user_id")
-        module_id    = data.get("module_id")
-        module_title = data.get("module_title", "")
-        xp_earned    = data.get("xp_earned", 0)
-        total_xp     = data.get("total_xp", 0)
-        badge_icon   = data.get("badge_icon", "🏅")
-        badge_name   = data.get("badge_name", "")
-        is_last      = data.get("is_last", False)
+        user_id   = data.get("user_id")
+        event     = data.get("event", "module_completed")
+        module_id = data.get("module_id")
 
         if not user_id:
             return web.json_response({"ok": False, "error": "no user_id"})
 
-        # Обновляем прогресс юзера
-        user = get_user(int(user_id))
-        completed = user.get("completed_modules", [])
-        if module_id not in completed:
-            completed.append(module_id)
+        # Обновляем last_seen и current_module при любом событии
+        update = {"last_seen": time.time()}
 
-        # Определяем следующий модуль
-        module_ids = list(MODULE_TITLES.keys())
-        current_idx = module_ids.index(module_id) if module_id in module_ids else 0
-        next_module = module_ids[current_idx + 1] if current_idx + 1 < len(module_ids) else module_id
+        if event == "module_opened":
+            # Юзер открыл модуль — обновляем current_module
+            update["current_module"] = module_id
+            update["day1_push_sent"] = True   # активен — не спамим Day1
+            upsert_user(int(user_id), update)
+            return web.json_response({"ok": True})
 
-        upsert_user(int(user_id), {
-            "last_seen":          time.time(),
-            "current_module":     next_module,
-            "completed_modules":  completed,
-            # Сбрасываем пуши — юзер активен, не спамим
-            "day1_push_sent":     True,
-            "day3_push_sent":     False,
-        })
+        if event == "module_completed":
+            module_title = data.get("module_title", "")
+            xp_earned    = data.get("xp_earned", 0)
+            total_xp     = data.get("total_xp", 0)
+            badge_icon   = data.get("badge_icon", "🏅")
+            badge_name   = data.get("badge_name", "")
+            is_last      = data.get("is_last", False)
 
-        # Отправляем поздравление
-        MODULE_MESSAGES = {
-            "mod_01": "Markets are no longer a mystery 🌐",
-            "mod_02": "You can now read a chart like a pro 📊",
-            "mod_03": "Risk management unlocked — the #1 skill of profitable traders 🛡️",
-            "mod_04": "You have a real trading process now 🚀",
-            "mod_05": "Most traders never study psychology — you did 👑",
-        }
-        flavor = MODULE_MESSAGES.get(module_id, "Module complete!")
+            # Обновляем прогресс
+            user = get_user(int(user_id))
+            completed = user.get("completed_modules", [])
+            if module_id not in completed:
+                completed.append(module_id)
 
-        if is_last:
-            text = (
-                f"{badge_icon} <b>Academy Graduate!</b>\n\n"
-                f"{flavor}\n\n"
-                f"You've completed all 5 modules and earned <b>{total_xp} XP</b>.\n\n"
-                f"You now have everything you need. Open a real account and make your first trade 👇"
+            module_ids = list(MODULE_TITLES.keys())
+            idx = module_ids.index(module_id) if module_id in module_ids else 0
+            next_mod = module_ids[idx + 1] if idx + 1 < len(module_ids) else module_id
+
+            update.update({
+                "current_module":    next_mod,
+                "completed_modules": completed,
+                "day1_push_sent":    True,
+                "day3_push_sent":    False,
+            })
+            upsert_user(int(user_id), update)
+
+            # Отправляем поздравление в Telegram
+            flavor = MODULE_MESSAGES.get(module_id, "Module complete!")
+
+            if is_last:
+                text = (
+                    f"{badge_icon} <b>Academy Graduate!</b>\n\n"
+                    f"{flavor}\n\n"
+                    f"You've completed all 5 modules and earned <b>{total_xp} XP</b>.\n\n"
+                    f"You now have everything you need. Open a real account and make your first trade 👇"
+                )
+                keyboard = kb_open_and_register()
+            else:
+                text = (
+                    f"{badge_icon} <b>{module_title} complete!</b>\n\n"
+                    f"{flavor}\n\n"
+                    f"<b>+{xp_earned} XP</b> · Total: <b>{total_xp} XP</b>\n\n"
+                    f"Ready for the next module? 👇"
+                )
+                keyboard = kb_continue()
+
+            await bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=keyboard
             )
-            keyboard = kb_open_and_register()
-        else:
-            text = (
-                f"{badge_icon} <b>{module_title} complete!</b>\n\n"
-                f"{flavor}\n\n"
-                f"<b>+{xp_earned} XP</b> · Total: <b>{total_xp} XP</b>\n\n"
-                f"Ready for the next module? 👇"
-            )
-            keyboard = kb_continue()
-
-        await bot.send_message(
-            chat_id=user_id,
-            text=text,
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
+            log.info(f"Module complete sent: user={user_id} module={module_id}")
 
         return web.json_response({"ok": True})
 
@@ -231,9 +245,8 @@ async def handle_tma_webhook(request: web.Request) -> web.Response:
         log.error(f"TMA webhook error: {e}")
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
-# ─── Retention Push Logic ─────────────────────────────────────────────────────
+# ─── Retention Pushes ─────────────────────────────────────────────────────────
 async def send_day1_push(user: dict):
-    """24ч без активности — напоминаем вернуться."""
     uid = user["id"]
     first_name = user.get("first_name", "Trader")
     current_mod = user.get("current_module", "mod_01")
@@ -241,7 +254,6 @@ async def send_day1_push(user: dict):
     completed_count = len(user.get("completed_modules", []))
 
     if completed_count == 0:
-        # Не начал ни одного модуля
         text = (
             f"Hey {first_name} 👋\n\n"
             f"You haven't started yet — and that's okay.\n\n"
@@ -250,7 +262,6 @@ async def send_day1_push(user: dict):
             f"Ready when you are 👇"
         )
     else:
-        # Начал, но не закончил
         text = (
             f"Hey {first_name} 👋\n\n"
             f"You left off on <b>{mod_title}</b>.\n\n"
@@ -258,21 +269,14 @@ async def send_day1_push(user: dict):
             f"keep going and earn your <b>Academy Graduate 👑</b> badge.\n\n"
             f"Takes less than 8 minutes 👇"
         )
-
     try:
-        await bot.send_message(
-            chat_id=uid,
-            text=text,
-            parse_mode="HTML",
-            reply_markup=kb_continue()
-        )
+        await bot.send_message(chat_id=uid, text=text, parse_mode="HTML", reply_markup=kb_continue())
         upsert_user(uid, {"day1_push_sent": True})
-        log.info(f"Day 1 push sent: user={uid}")
+        log.info(f"Day1 push sent: {uid}")
     except Exception as e:
-        log.warning(f"Day 1 push failed for {uid}: {e}")
+        log.warning(f"Day1 push failed {uid}: {e}")
 
 async def send_day3_push(user: dict):
-    """72ч без активности — более сильный CTA."""
     uid = user["id"]
     first_name = user.get("first_name", "Trader")
     current_mod = user.get("current_module", "mod_01")
@@ -281,59 +285,34 @@ async def send_day3_push(user: dict):
     text = (
         f"Hey {first_name} — still thinking about trading? 📈\n\n"
         f"<b>{mod_title}</b> is waiting for you.\n\n"
-        f"Most people who start Weltrade Academy and finish "
-        f"all 5 modules make their first trade within a week.\n\n"
+        f"Most people who finish all 5 modules make their first trade within a week.\n\n"
         f"You're closer than you think 👇"
     )
-
     try:
-        await bot.send_message(
-            chat_id=uid,
-            text=text,
-            parse_mode="HTML",
-            reply_markup=kb_open_and_register()
-        )
+        await bot.send_message(chat_id=uid, text=text, parse_mode="HTML", reply_markup=kb_open_and_register())
         upsert_user(uid, {"day3_push_sent": True})
-        log.info(f"Day 3 push sent: user={uid}")
+        log.info(f"Day3 push sent: {uid}")
     except Exception as e:
-        log.warning(f"Day 3 push failed for {uid}: {e}")
+        log.warning(f"Day3 push failed {uid}: {e}")
 
-# ─── Scheduler — проверяем каждый час ─────────────────────────────────────────
 async def retention_scheduler():
-    """
-    Каждый час проходим по всем юзерам и проверяем:
-    - Прошло 24ч с last_seen и day1_push не отправлен → Day 1 push
-    - Прошло 72ч с last_seen и day3_push не отправлен → Day 3 push
-    Не отправляем тем кто уже прошёл все модули.
-    """
     while True:
-        await asyncio.sleep(3600)  # проверяем каждый час
+        await asyncio.sleep(3600)
         now = time.time()
         users = load_users()
-
         log.info(f"Retention check: {len(users)} users")
-
         for uid, user in users.items():
-            # Пропускаем тех кто прошёл все 5 модулей
             if len(user.get("completed_modules", [])) >= 5:
                 continue
-
-            last_seen = user.get("last_seen", now)
-            hours_inactive = (now - last_seen) / 3600
-
-            # Day 1 push: 24-48ч без активности
-            if (24 <= hours_inactive < 48
-                    and not user.get("day1_push_sent", False)):
+            hours = (now - user.get("last_seen", now)) / 3600
+            if 24 <= hours < 48 and not user.get("day1_push_sent", False):
                 await send_day1_push(user)
-                await asyncio.sleep(0.1)  # небольшая пауза между отправками
-
-            # Day 3 push: 72ч+ без активности
-            elif (hours_inactive >= 72
-                    and not user.get("day3_push_sent", False)):
+                await asyncio.sleep(0.1)
+            elif hours >= 72 and not user.get("day3_push_sent", False):
                 await send_day3_push(user)
                 await asyncio.sleep(0.1)
 
-# ─── Health check ─────────────────────────────────────────────────────────────
+# ─── Health ───────────────────────────────────────────────────────────────────
 async def handle_health(request: web.Request) -> web.Response:
     users = load_users()
     return web.json_response({
@@ -342,23 +321,29 @@ async def handle_health(request: web.Request) -> web.Response:
         "service": "weltrade-academy-bot"
     })
 
-# ─── App Setup ────────────────────────────────────────────────────────────────
+# ─── App ──────────────────────────────────────────────────────────────────────
 async def on_startup(app: web.Application):
     if WEBHOOK_URL:
         await bot.set_webhook(f"{WEBHOOK_URL}/webhook")
-        log.info(f"Webhook set: {WEBHOOK_URL}/webhook")
-    # Запускаем планировщик в фоне
+        log.info(f"Webhook: {WEBHOOK_URL}/webhook")
     asyncio.create_task(retention_scheduler())
-    log.info("Retention scheduler started")
+    log.info("Scheduler started")
 
 async def on_shutdown(app: web.Application):
     await bot.delete_webhook()
     await bot.session.close()
 
 def create_app() -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[cors_middleware])
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
     app.router.add_post("/tma-webhook", handle_tma_webhook)
+    app.router.add_route("OPTIONS", "/tma-webhook", lambda r: web.Response(
+        headers={
+            "Access-Control-Allow-Origin":  "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+        }
+    ))
     app.router.add_get("/health", handle_health)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
