@@ -168,7 +168,6 @@ async def handle_help(message: types.Message):
 async def handle_tma_webhook(request: web.Request) -> web.Response:
     try:
         data = await request.json()
-        log.info(f"TMA webhook data: {data}")
         user_id   = data.get("user_id")
         event     = data.get("event", "module_completed")
         module_id = data.get("module_id")
