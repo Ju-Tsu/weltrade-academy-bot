@@ -492,41 +492,42 @@ async def send_day3_push(user: dict):
 
 # ─── Scheduler ────────────────────────────────────────────────────────────────
 async def retention_scheduler():
-    """Каждый час проверяем всех юзеров на retention и demo trigger.
-    Обёрнут в try/except — краш внутри не убивает планировщик."""
+    """Каждый час проверяем всех юзеров на retention и demo trigger."""
     while True:
         try:
             await asyncio.sleep(3600)
-        now = time.time()
-        users = load_users()
-        log.info(f"Scheduler check: {len(users)} users")
+            now = time.time()
+            users = load_users()
+            log.info(f"Scheduler check: {len(users)} users")
 
-        for uid, user in users.items():
-            completed = user.get("completed_modules", [])
-            last_seen = user.get("last_seen", now)
-            hours_inactive = (now - last_seen) / 3600
+            for uid, user in users.items():
+                completed = user.get("completed_modules", [])
+                last_seen = user.get("last_seen", now)
+                hours_inactive = (now - last_seen) / 3600
 
-            # ── Demo trigger: 3 дня после клика на демо ───────────────────────
-            demo_clicked_at = user.get("demo_clicked_at")
-            demo_trigger_sent = user.get("demo_trigger_sent", False)
+                demo_clicked_at = user.get("demo_clicked_at")
+                demo_trigger_sent = user.get("demo_trigger_sent", False)
 
-            if (demo_clicked_at
-                    and not demo_trigger_sent
-                    and (now - demo_clicked_at) >= 72 * 3600):
-                await send_demo_trigger(user)
-                await asyncio.sleep(0.1)
-                continue  # не спамим retention push если уже отправили demo trigger
+                if (demo_clicked_at
+                        and not demo_trigger_sent
+                        and (now - demo_clicked_at) >= 72 * 3600):
+                    await send_demo_trigger(user)
+                    await asyncio.sleep(0.1)
+                    continue
 
-            # ── Retention пуши (только если не прошёл все модули) ─────────────
-            if len(completed) >= 5:
-                continue
+                if len(completed) >= 5:
+                    continue
 
-            if 24 <= hours_inactive < 48 and not user.get("day1_push_sent", False):
-                await send_day1_push(user)
-                await asyncio.sleep(0.1)
-            elif hours_inactive >= 72 and not user.get("day3_push_sent", False):
-                await send_day3_push(user)
-                await asyncio.sleep(0.1)
+                if 24 <= hours_inactive < 48 and not user.get("day1_push_sent", False):
+                    await send_day1_push(user)
+                    await asyncio.sleep(0.1)
+                elif hours_inactive >= 72 and not user.get("day3_push_sent", False):
+                    await send_day3_push(user)
+                    await asyncio.sleep(0.1)
+
+        except Exception as e:
+            log.error(f"Retention scheduler error: {e}")
+            await asyncio.sleep(60)
 
 # ─── Health ───────────────────────────────────────────────────────────────────
 async def handle_health(request: web.Request) -> web.Response:
