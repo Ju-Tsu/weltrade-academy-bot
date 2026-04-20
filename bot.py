@@ -1,5 +1,13 @@
 """
-Weltrade Academy Bot v2 — retention pushes + CORS fix
+Weltrade Academy Bot v3
+────────────────────────────────────────────────────────
+Новое в v3:
+  - startapp параметр: t.me/bot?start=inf_bloger
+    → кастомное приветствие + сохранение источника
+  - Demo trigger: юзер нажал "Try demo" →
+    через 3 дня бот пишет "готов к реальному счёту?"
+  - Day 1 / Day 3 retention пуши (из v2)
+  - CORS для TMA webhook (из v2)
 """
 
 import asyncio
@@ -22,6 +30,12 @@ TMA_URL     = os.environ["TMA_URL"]
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT        = int(os.environ.get("PORT", 8080))
 
+REGISTER_URL = (
+    "https://track.gowt.me/visit/?bta=66558&brand=weltrade"
+    "&utm_source=telegram_organic&utm_medium=bot"
+    "&utm_campaign=bot_demo_trigger_cta"
+)
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
@@ -29,24 +43,18 @@ bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
 # ─── CORS Middleware ──────────────────────────────────────────────────────────
-# Нужен чтобы TMA на Vercel мог слать запросы на Railway
 @web.middleware
 async def cors_middleware(request: web.Request, handler):
-    # Preflight запрос от браузера — отвечаем сразу
     if request.method == "OPTIONS":
-        return web.Response(
-            status=200,
-            headers={
-                "Access-Control-Allow-Origin":  "*",
-                "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type",
-            }
-        )
+        return web.Response(status=200, headers={
+            "Access-Control-Allow-Origin":  "*",
+            "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+        })
     try:
         response = await handler(request)
     except web.HTTPException as ex:
         response = ex
-
     response.headers["Access-Control-Allow-Origin"]  = "*"
     response.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
@@ -67,7 +75,7 @@ def save_users(users: dict):
     try:
         USERS_FILE.write_text(json.dumps(users, indent=2))
     except Exception as e:
-        log.error(f"Failed to save users: {e}")
+        log.error(f"Save failed: {e}")
 
 def upsert_user(user_id: int, data: dict):
     users = load_users()
@@ -91,17 +99,22 @@ def kb_continue() -> InlineKeyboardMarkup:
     builder.button(text="▶ Continue Learning", web_app=WebAppInfo(url=TMA_URL))
     return builder.as_markup()
 
-def kb_open_and_register() -> InlineKeyboardMarkup:
+def kb_demo_to_real() -> InlineKeyboardMarkup:
+    """Кнопки после demo trigger — мост из демо в реальный счёт."""
     builder = InlineKeyboardBuilder()
-    builder.button(text="▶ Continue Learning", web_app=WebAppInfo(url=TMA_URL))
-    builder.button(
-        text="🚀 Create Account",
-        url="https://track.gowt.me/visit/?bta=66558&brand=weltrade&utm_source=telegram_organic&utm_medium=bot&utm_campaign=bot_graduation_cta"
-    )
+    builder.button(text="🚀 Open Real Account", url=REGISTER_URL)
+    builder.button(text="📚 Continue Learning", web_app=WebAppInfo(url=TMA_URL))
     builder.adjust(1)
     return builder.as_markup()
 
-# ─── Module titles ────────────────────────────────────────────────────────────
+def kb_open_and_register() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="▶ Continue Learning", web_app=WebAppInfo(url=TMA_URL))
+    builder.button(text="🚀 Create Account", url=REGISTER_URL)
+    builder.adjust(1)
+    return builder.as_markup()
+
+# ─── Module data ──────────────────────────────────────────────────────────────
 MODULE_TITLES = {
     "mod_01": "Intro to Markets",
     "mod_02": "Reading Charts",
@@ -118,12 +131,33 @@ MODULE_MESSAGES = {
     "mod_05": "Most traders never study psychology — you did 👑",
 }
 
+# ─── Influencer name resolver ─────────────────────────────────────────────────
+# Маппинг UTM → человекочитаемое имя для кастомного приветствия
+# Добавляй новых инфлюенсеров сюда
+INFLUENCER_NAMES = {
+    # "inf_bloger_name": "Имя блогера",
+    # Примеры:
+    # "inf_cryptoivan": "Crypto Ivan",
+    # "inf_tradingpro": "Trading Pro",
+}
+
+def get_influencer_name(source: str) -> str | None:
+    """Возвращает имя инфлюенсера по startapp параметру."""
+    if source and source.startswith("inf_"):
+        return INFLUENCER_NAMES.get(source, source.replace("inf_", "").replace("_", " ").title())
+    return None
+
 # ─── /start ───────────────────────────────────────────────────────────────────
 @dp.message(CommandStart())
 async def handle_start(message: types.Message):
     user = message.from_user
     first_name = user.first_name or "Trader"
     now = time.time()
+
+    # Извлекаем startapp параметр: /start inf_bloger_name
+    args = message.text.split(maxsplit=1)
+    start_param = args[1].strip() if len(args) > 1 else ""
+    influencer_name = get_influencer_name(start_param)
 
     upsert_user(user.id, {
         "id":                user.id,
@@ -133,20 +167,34 @@ async def handle_start(message: types.Message):
         "last_seen":         now,
         "current_module":    "mod_01",
         "completed_modules": [],
+        "source":            start_param or "organic",
         "day1_push_sent":    False,
         "day3_push_sent":    False,
+        "demo_clicked_at":   None,
+        "demo_trigger_sent": False,
     })
 
-    await message.answer(
-        f"Hey {first_name} 👋\n\n"
-        f"Welcome to <b>Weltrade Academy</b> — learn trading in short modules, "
-        f"earn XP, and get ready for your first real trade.\n\n"
-        f"📚 5 modules · ~36 min total · completely free\n\n"
-        f"Tap below to start 👇",
-        parse_mode="HTML",
-        reply_markup=kb_open_academy()
-    )
-    log.info(f"New user: {user.id} (@{user.username})")
+    # Кастомное приветствие если пришёл от инфлюенсера
+    if influencer_name:
+        text = (
+            f"Hey {first_name} 👋\n\n"
+            f"You're here from <b>{influencer_name}</b> — great choice.\n\n"
+            f"<b>Weltrade Academy</b> will teach you the basics of trading "
+            f"in 5 short modules. Completely free.\n\n"
+            f"📚 5 modules · ~36 min · earn XP and badges\n\n"
+            f"Tap below to start 👇"
+        )
+    else:
+        text = (
+            f"Hey {first_name} 👋\n\n"
+            f"Welcome to <b>Weltrade Academy</b> — learn trading in short modules, "
+            f"earn XP, and get ready for your first real trade.\n\n"
+            f"📚 5 modules · ~36 min total · completely free\n\n"
+            f"Tap below to start 👇"
+        )
+
+    await message.answer(text, parse_mode="HTML", reply_markup=kb_open_academy())
+    log.info(f"New user: {user.id} (@{user.username}) source={start_param or 'organic'}")
 
 # ─── /help ────────────────────────────────────────────────────────────────────
 @dp.message(Command("help"))
@@ -164,10 +212,12 @@ async def handle_help(message: types.Message):
         reply_markup=kb_open_academy()
     )
 
-# ─── TMA Webhook ─────────────────────────────────────────────────────────────
+# ─── TMA Webhook ──────────────────────────────────────────────────────────────
 async def handle_tma_webhook(request: web.Request) -> web.Response:
     try:
         data = await request.json()
+        log.info(f"TMA webhook: {data}")
+
         user_id   = data.get("user_id")
         event     = data.get("event", "module_completed")
         module_id = data.get("module_id")
@@ -175,25 +225,32 @@ async def handle_tma_webhook(request: web.Request) -> web.Response:
         if not user_id:
             return web.json_response({"ok": False, "error": "no user_id"})
 
-        # Обновляем last_seen и current_module при любом событии
         update = {"last_seen": time.time()}
 
+        # ── Юзер открыл модуль ───────────────────────────────────────────────
         if event == "module_opened":
-            # Юзер открыл модуль — обновляем current_module
             update["current_module"] = module_id
-            update["day1_push_sent"] = True   # активен — не спамим Day1
+            update["day1_push_sent"] = True
             upsert_user(int(user_id), update)
             return web.json_response({"ok": True})
 
+        # ── Юзер нажал Demo CTA ───────────────────────────────────────────────
+        # Сохраняем время клика — через 3 дня отправим demo trigger
+        if event == "demo_cta_clicked":
+            update["demo_clicked_at"]   = time.time()
+            update["demo_trigger_sent"] = False
+            upsert_user(int(user_id), update)
+            log.info(f"Demo clicked: user={user_id}")
+            return web.json_response({"ok": True})
+
+        # ── Модуль завершён ───────────────────────────────────────────────────
         if event == "module_completed":
             module_title = data.get("module_title", "")
             xp_earned    = data.get("xp_earned", 0)
             total_xp     = data.get("total_xp", 0)
             badge_icon   = data.get("badge_icon", "🏅")
-            badge_name   = data.get("badge_name", "")
             is_last      = data.get("is_last", False)
 
-            # Обновляем прогресс
             user = get_user(int(user_id))
             completed = user.get("completed_modules", [])
             if module_id not in completed:
@@ -211,7 +268,6 @@ async def handle_tma_webhook(request: web.Request) -> web.Response:
             })
             upsert_user(int(user_id), update)
 
-            # Отправляем поздравление в Telegram
             flavor = MODULE_MESSAGES.get(module_id, "Module complete!")
 
             if is_last:
@@ -232,10 +288,8 @@ async def handle_tma_webhook(request: web.Request) -> web.Response:
                 keyboard = kb_continue()
 
             await bot.send_message(
-                chat_id=user_id,
-                text=text,
-                parse_mode="HTML",
-                reply_markup=keyboard
+                chat_id=user_id, text=text,
+                parse_mode="HTML", reply_markup=keyboard
             )
             log.info(f"Module complete sent: user={user_id} module={module_id}")
 
@@ -245,9 +299,56 @@ async def handle_tma_webhook(request: web.Request) -> web.Response:
         log.error(f"TMA webhook error: {e}")
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
+# ─── Demo Trigger ─────────────────────────────────────────────────────────────
+async def send_demo_trigger(user: dict):
+    """
+    Юзер нажал 'Try demo' → через 3 дня спрашиваем готов ли к реальному счёту.
+    Это главный мост из демо в FTD.
+    """
+    uid = user.get("id") or user.get("user_id")
+    if not uid:
+        log.warning(f"send_demo_trigger: no id in user record")
+        return
+    first_name = user.get("first_name", "Trader")
+    completed_count = len(user.get("completed_modules", []))
+
+    if completed_count >= 3:
+        # Прошёл 3+ модуля — уверенный месседж
+        text = (
+            f"Hey {first_name} 📈\n\n"
+            f"You've been on the demo account for a few days — "
+            f"and you've completed {completed_count} modules.\n\n"
+            f"That means you already know: how markets work, "
+            f"how to read charts, and how to manage risk.\n\n"
+            f"<b>Most traders who reach this point are ready for a real account.</b>\n\n"
+            f"The minimum deposit is small. The knowledge you have is real. 👇"
+        )
+    else:
+        # Прошёл мало модулей — мягче
+        text = (
+            f"Hey {first_name} 👋\n\n"
+            f"How's the demo going?\n\n"
+            f"When you feel ready to trade with real money — "
+            f"the process takes 2 minutes.\n\n"
+            f"Finish the remaining modules first if you want to feel more confident 👇"
+        )
+
+    try:
+        await bot.send_message(
+            chat_id=uid, text=text,
+            parse_mode="HTML", reply_markup=kb_demo_to_real()
+        )
+        upsert_user(uid, {"demo_trigger_sent": True})
+        log.info(f"Demo trigger sent: user={uid}")
+    except Exception as e:
+        log.warning(f"Demo trigger failed {uid}: {e}")
+
 # ─── Retention Pushes ─────────────────────────────────────────────────────────
 async def send_day1_push(user: dict):
-    uid = user["id"]
+    uid = user.get("id") or user.get("user_id")
+    if not uid:
+        log.warning(f"send_day1_push: no id in user record {user}")
+        return
     first_name = user.get("first_name", "Trader")
     current_mod = user.get("current_module", "mod_01")
     mod_title = MODULE_TITLES.get(current_mod, "your next module")
@@ -258,7 +359,7 @@ async def send_day1_push(user: dict):
             f"Hey {first_name} 👋\n\n"
             f"You haven't started yet — and that's okay.\n\n"
             f"<b>Intro to Markets</b> takes just 7 minutes. "
-            f"That's less time than your morning coffee ☕\n\n"
+            f"Less time than your morning coffee ☕\n\n"
             f"Ready when you are 👇"
         )
     else:
@@ -277,7 +378,10 @@ async def send_day1_push(user: dict):
         log.warning(f"Day1 push failed {uid}: {e}")
 
 async def send_day3_push(user: dict):
-    uid = user["id"]
+    uid = user.get("id") or user.get("user_id")
+    if not uid:
+        log.warning(f"send_day3_push: no id in user record {user}")
+        return
     first_name = user.get("first_name", "Trader")
     current_mod = user.get("current_module", "mod_01")
     mod_title = MODULE_TITLES.get(current_mod, "your next module")
@@ -295,20 +399,41 @@ async def send_day3_push(user: dict):
     except Exception as e:
         log.warning(f"Day3 push failed {uid}: {e}")
 
+# ─── Scheduler ────────────────────────────────────────────────────────────────
 async def retention_scheduler():
+    """Каждый час проверяем всех юзеров на retention и demo trigger.
+    Обёрнут в try/except — краш внутри не убивает планировщик."""
     while True:
-        await asyncio.sleep(3600)
+        try:
+            await asyncio.sleep(3600)
         now = time.time()
         users = load_users()
-        log.info(f"Retention check: {len(users)} users")
+        log.info(f"Scheduler check: {len(users)} users")
+
         for uid, user in users.items():
-            if len(user.get("completed_modules", [])) >= 5:
+            completed = user.get("completed_modules", [])
+            last_seen = user.get("last_seen", now)
+            hours_inactive = (now - last_seen) / 3600
+
+            # ── Demo trigger: 3 дня после клика на демо ───────────────────────
+            demo_clicked_at = user.get("demo_clicked_at")
+            demo_trigger_sent = user.get("demo_trigger_sent", False)
+
+            if (demo_clicked_at
+                    and not demo_trigger_sent
+                    and (now - demo_clicked_at) >= 72 * 3600):
+                await send_demo_trigger(user)
+                await asyncio.sleep(0.1)
+                continue  # не спамим retention push если уже отправили demo trigger
+
+            # ── Retention пуши (только если не прошёл все модули) ─────────────
+            if len(completed) >= 5:
                 continue
-            hours = (now - user.get("last_seen", now)) / 3600
-            if 24 <= hours < 48 and not user.get("day1_push_sent", False):
+
+            if 24 <= hours_inactive < 48 and not user.get("day1_push_sent", False):
                 await send_day1_push(user)
                 await asyncio.sleep(0.1)
-            elif hours >= 72 and not user.get("day3_push_sent", False):
+            elif hours_inactive >= 72 and not user.get("day3_push_sent", False):
                 await send_day3_push(user)
                 await asyncio.sleep(0.1)
 
@@ -316,9 +441,9 @@ async def retention_scheduler():
 async def handle_health(request: web.Request) -> web.Response:
     users = load_users()
     return web.json_response({
-        "status": "ok",
+        "status":      "ok",
         "users_total": len(users),
-        "service": "weltrade-academy-bot"
+        "service":     "weltrade-academy-bot-v3",
     })
 
 # ─── App ──────────────────────────────────────────────────────────────────────
@@ -326,6 +451,18 @@ async def on_startup(app: web.Application):
     if WEBHOOK_URL:
         await bot.set_webhook(f"{WEBHOOK_URL}/webhook")
         log.info(f"Webhook: {WEBHOOK_URL}/webhook")
+
+    # Миграция: фикс старых записей без поля "id"
+    users = load_users()
+    fixed = 0
+    for uid_str, user in users.items():
+        if "id" not in user:
+            user["id"] = int(uid_str)
+            fixed += 1
+    if fixed:
+        save_users(users)
+        log.info(f"Migration: fixed {fixed} user records without 'id' field")
+
     asyncio.create_task(retention_scheduler())
     log.info("Scheduler started")
 
