@@ -148,16 +148,52 @@ def get_influencer_name(source: str) -> str | None:
     return None
 
 # ─── /start ───────────────────────────────────────────────────────────────────
+# ─── Welcome messages (EN / ES / PT) ─────────────────────────────────────────
+def get_welcome_text(first_name: str, lang: str) -> str:
+    if lang == "es":
+        return (
+            f"¡Hola {first_name}! 👋\n\n"
+            f"Bienvenido a <b>Weltrade Academy</b> — aprende trading en módulos cortos, "
+            f"gana XP y prepárate para tu primera operación real.\n\n"
+            f"📚 5 módulos · ~36 min en total · completamente gratis\n\n"
+            f"Pulsa el botón de abajo para empezar 👇"
+        )
+    elif lang == "pt":
+        return (
+            f"Olá {first_name}! 👋\n\n"
+            f"Bem-vindo à <b>Weltrade Academy</b> — aprenda trading em módulos curtos, "
+            f"ganhe XP e prepare-se para sua primeira operação real.\n\n"
+            f"📚 5 módulos · ~36 min no total · completamente grátis\n\n"
+            f"Toque no botão abaixo para começar 👇"
+        )
+    else:
+        return (
+            f"Hey {first_name}! 👋\n\n"
+            f"Welcome to <b>Weltrade Academy</b> — learn trading in short modules, "
+            f"earn XP, and get ready for your first real trade.\n\n"
+            f"📚 5 modules · ~36 min total · completely free\n\n"
+            f"Tap the button below to start 👇"
+        )
+
+def detect_lang(start_param: str, tg_lang: str) -> str:
+    """Определяем язык: сначала по суффиксу ссылки, потом по языку Telegram."""
+    if start_param.endswith("_es"): return "es"
+    if start_param.endswith("_pt"): return "pt"
+    if start_param.endswith("_en"): return "en"
+    if tg_lang.startswith("es"): return "es"
+    if tg_lang.startswith("pt"): return "pt"
+    return "en"
+
 @dp.message(CommandStart())
 async def handle_start(message: types.Message):
     user = message.from_user
     first_name = user.first_name or "Trader"
     now = time.time()
 
-    # Извлекаем startapp параметр: /start inf_bloger_name
     args = message.text.split(maxsplit=1)
     start_param = args[1].strip() if len(args) > 1 else ""
-    influencer_name = get_influencer_name(start_param)
+    tg_lang = user.language_code or ""
+    lang = detect_lang(start_param, tg_lang)
 
     upsert_user(user.id, {
         "id":                user.id,
@@ -165,6 +201,7 @@ async def handle_start(message: types.Message):
         "username":          user.username or "",
         "started_at":        now,
         "last_seen":         now,
+        "lang":              lang,
         "current_module":    "mod_01",
         "completed_modules": [],
         "source":            start_param or "organic",
@@ -174,27 +211,9 @@ async def handle_start(message: types.Message):
         "demo_trigger_sent": False,
     })
 
-    # Кастомное приветствие если пришёл от инфлюенсера
-    if influencer_name:
-        text = (
-            f"Hey {first_name} 👋\n\n"
-            f"You're here from <b>{influencer_name}</b> — great choice.\n\n"
-            f"<b>Weltrade Academy</b> will teach you the basics of trading "
-            f"in 5 short modules. Completely free.\n\n"
-            f"📚 5 modules · ~36 min · earn XP and badges\n\n"
-            f"Tap below to start 👇"
-        )
-    else:
-        text = (
-            f"Hey {first_name} 👋\n\n"
-            f"Welcome to <b>Weltrade Academy</b> — learn trading in short modules, "
-            f"earn XP, and get ready for your first real trade.\n\n"
-            f"📚 5 modules · ~36 min total · completely free\n\n"
-            f"Tap below to start 👇"
-        )
-
+    text = get_welcome_text(first_name, lang)
     await message.answer(text, parse_mode="HTML", reply_markup=kb_open_academy())
-    log.info(f"New user: {user.id} (@{user.username}) source={start_param or 'organic'}")
+    log.info(f"New user: {user.id} (@{user.username}) lang={lang} source={start_param or 'organic'}")
 
 # ─── /help ────────────────────────────────────────────────────────────────────
 @dp.message(Command("help"))
@@ -344,32 +363,88 @@ async def send_demo_trigger(user: dict):
         log.warning(f"Demo trigger failed {uid}: {e}")
 
 # ─── Retention Pushes ─────────────────────────────────────────────────────────
+MODULE_TITLES_ES = {
+    "mod_01": "Introducción a los Mercados",
+    "mod_02": "Lectura de Gráficos",
+    "mod_03": "Gestión de Riesgo",
+    "mod_04": "Tu Primera Operación",
+    "mod_05": "Psicología del Trading",
+}
+MODULE_TITLES_PT = {
+    "mod_01": "Introdução aos Mercados",
+    "mod_02": "Leitura de Gráficos",
+    "mod_03": "Gestão de Risco",
+    "mod_04": "Sua Primeira Operação",
+    "mod_05": "Psicologia do Trading",
+}
+
+def get_mod_title(mod_id: str, lang: str) -> str:
+    if lang == "es": return MODULE_TITLES_ES.get(mod_id, mod_id)
+    if lang == "pt": return MODULE_TITLES_PT.get(mod_id, mod_id)
+    return MODULE_TITLES.get(mod_id, mod_id)
+
 async def send_day1_push(user: dict):
     uid = user.get("id") or user.get("user_id")
     if not uid:
         log.warning(f"send_day1_push: no id in user record {user}")
         return
     first_name = user.get("first_name", "Trader")
+    lang = user.get("lang", "en")
     current_mod = user.get("current_module", "mod_01")
-    mod_title = MODULE_TITLES.get(current_mod, "your next module")
+    mod_title = get_mod_title(current_mod, lang)
     completed_count = len(user.get("completed_modules", []))
 
-    if completed_count == 0:
-        text = (
-            f"Hey {first_name} 👋\n\n"
-            f"You haven't started yet — and that's okay.\n\n"
-            f"<b>Intro to Markets</b> takes just 7 minutes. "
-            f"Less time than your morning coffee ☕\n\n"
-            f"Ready when you are 👇"
-        )
+    if lang == "es":
+        if completed_count == 0:
+            text = (
+                f"¡Hola {first_name}! 👋\n\n"
+                f"Todavía no has empezado — y está bien.\n\n"
+                f"<b>Introducción a los Mercados</b> tarda solo 7 minutos. "
+                f"Menos que tu café de la mañana ☕\n\n"
+                f"Te esperamos cuando quieras 👇"
+            )
+        else:
+            text = (
+                f"¡Hola {first_name}! 👋\n\n"
+                f"Te quedaste en <b>{mod_title}</b>.\n\n"
+                f"Llevas {completed_count}/5 módulos — "
+                f"sigue y gana tu insignia <b>Graduado de la Academia 👑</b>.\n\n"
+                f"Menos de 8 minutos 👇"
+            )
+    elif lang == "pt":
+        if completed_count == 0:
+            text = (
+                f"Olá {first_name}! 👋\n\n"
+                f"Você ainda não começou — tudo bem.\n\n"
+                f"<b>Introdução aos Mercados</b> leva apenas 7 minutos. "
+                f"Menos tempo que o seu café da manhã ☕\n\n"
+                f"Estamos aqui quando você quiser 👇"
+            )
+        else:
+            text = (
+                f"Olá {first_name}! 👋\n\n"
+                f"Você parou em <b>{mod_title}</b>.\n\n"
+                f"Você está em {completed_count}/5 módulos — "
+                f"continue e ganhe sua medalha <b>Graduado da Academia 👑</b>.\n\n"
+                f"Menos de 8 minutos 👇"
+            )
     else:
-        text = (
-            f"Hey {first_name} 👋\n\n"
-            f"You left off on <b>{mod_title}</b>.\n\n"
-            f"You're {completed_count}/5 modules in — "
-            f"keep going and earn your <b>Academy Graduate 👑</b> badge.\n\n"
-            f"Takes less than 8 minutes 👇"
-        )
+        if completed_count == 0:
+            text = (
+                f"Hey {first_name}! 👋\n\n"
+                f"You haven't started yet — and that's okay.\n\n"
+                f"<b>Intro to Markets</b> takes just 7 minutes. "
+                f"Less time than your morning coffee ☕\n\n"
+                f"Ready when you are 👇"
+            )
+        else:
+            text = (
+                f"Hey {first_name}! 👋\n\n"
+                f"You left off on <b>{mod_title}</b>.\n\n"
+                f"You're {completed_count}/5 modules in — "
+                f"keep going and earn your <b>Academy Graduate 👑</b> badge.\n\n"
+                f"Takes less than 8 minutes 👇"
+            )
     try:
         await bot.send_message(chat_id=uid, text=text, parse_mode="HTML", reply_markup=kb_continue())
         upsert_user(uid, {"day1_push_sent": True})
@@ -383,15 +458,31 @@ async def send_day3_push(user: dict):
         log.warning(f"send_day3_push: no id in user record {user}")
         return
     first_name = user.get("first_name", "Trader")
+    lang = user.get("lang", "en")
     current_mod = user.get("current_module", "mod_01")
-    mod_title = MODULE_TITLES.get(current_mod, "your next module")
+    mod_title = get_mod_title(current_mod, lang)
 
-    text = (
-        f"Hey {first_name} — still thinking about trading? 📈\n\n"
-        f"<b>{mod_title}</b> is waiting for you.\n\n"
-        f"Most people who finish all 5 modules make their first trade within a week.\n\n"
-        f"You're closer than you think 👇"
-    )
+    if lang == "es":
+        text = (
+            f"¡Hola {first_name}! ¿Todavía pensando en el trading? 📈\n\n"
+            f"<b>{mod_title}</b> te está esperando.\n\n"
+            f"La mayoría de las personas que completan los 5 módulos hacen su primera operación en una semana.\n\n"
+            f"Estás más cerca de lo que crees 👇"
+        )
+    elif lang == "pt":
+        text = (
+            f"Olá {first_name}! Ainda pensando em trading? 📈\n\n"
+            f"<b>{mod_title}</b> está esperando por você.\n\n"
+            f"A maioria das pessoas que completa os 5 módulos faz sua primeira operação em uma semana.\n\n"
+            f"Você está mais perto do que imagina 👇"
+        )
+    else:
+        text = (
+            f"Hey {first_name} — still thinking about trading? 📈\n\n"
+            f"<b>{mod_title}</b> is waiting for you.\n\n"
+            f"Most people who finish all 5 modules make their first trade within a week.\n\n"
+            f"You're closer than you think 👇"
+        )
     try:
         await bot.send_message(chat_id=uid, text=text, parse_mode="HTML", reply_markup=kb_open_and_register())
         upsert_user(uid, {"day3_push_sent": True})
